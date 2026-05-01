@@ -1,6 +1,8 @@
 import socket
 import struct # bib que trabalha com bytes binários compactados
 import random # pra simular perda aleatória
+import time
+import csv
 
 """
 Função para montar o cabeçalho
@@ -34,6 +36,21 @@ def decode_header(header):
     return seq, ack_num, data_len, flags
 
 
+# =========================
+# LOGS (visual + CSV)
+# =========================
+def log(evento, **dados):
+    tempo = f"{time.time():.3f}"
+    info = " | ".join(f"{k}={v}" for k, v in dados.items())
+    print(f"[{tempo}] {evento:<18} | {info}")
+
+log_file = open("server_log.csv", "w", newline="")
+writer = csv.writer(log_file)
+writer.writerow(["tempo", "evento", "seq", "ack"])
+
+def log_csv(evento, seq=None, ack=None):
+    writer.writerow([time.time(), evento, seq, ack])
+
 
 """
 Inicialização do socket UDP 
@@ -41,7 +58,7 @@ Inicialização do socket UDP
 # criando socket UDP
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # AF_INET = IPv4, SOCK_DGRAM = UDP
 server.bind(('localhost', 6789))
-print("Servidor pronto: Aguardando pacotes...")
+log("SERVER_START")
 
 expected_seq = 0  # próximo número de sequência que o servidor espera receber 
 
@@ -61,7 +78,7 @@ while True: # sempre na escuta
     if data_len > 0:
         pacotes_recebidos += 1
         if pacotes_recebidos == PROXIMA_PERDA:
-            print(f"--- SIMULANDO PERDA PROGRAMADA: Pacote SEQ {seq} descartado ---")
+            log("PERDA_SIMULADA", seq=seq)
             # Resetamos ou avançamos o próximo alvo se quiser testar múltiplas perdas
             PROXIMA_PERDA = 999 
             continue
@@ -72,14 +89,16 @@ while True: # sempre na escuta
         # responde com ACK e SYN (4 + 2 = 6) 
         ack_packet = create_header(100, expected_seq, 0, 6) 
         server.sendto(ack_packet, addr)
-        print(f"Handshake: SYN recebido. Enviando ACK {expected_seq}")
+        log("HANDSHAKE", ack=expected_seq)
     
     # PACOTE PADRÃO (não é SYN e contém dados)
     elif data_len > 0:
         if seq == expected_seq: # se for o pacote correto na ordem, faz a confirmação
             expected_seq += data_len
-            print(f"Recebido: {data_len} bytes (SEQ {seq}). Novo ACK esperado: {expected_seq}")
+            log("RECEBIDO", seq=seq, bytes=data_len, prox_ack=expected_seq)
+            log_csv("RECEBIDO", seq=seq, ack=expected_seq)
         
         # manda o ACK confirmando o que já recebeu (ou repetindo o último se veio fora de ordem)
         ack_packet = create_header(0, expected_seq, 0, 4) # Flag A (ACK=4) 
         server.sendto(ack_packet, addr)
+        log("ACK_ENVIADO", ack=expected_seq)
