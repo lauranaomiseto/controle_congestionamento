@@ -51,6 +51,7 @@ writer.writerow(["tempo", "evento", "seq", "ack"])
 
 def log_csv(evento, seq=None, ack=None):
     writer.writerow([time.time(), evento, seq, ack])
+    log_file.flush()
 
 
 """
