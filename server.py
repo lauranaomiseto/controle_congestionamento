@@ -50,6 +50,7 @@ writer.writerow(["tempo", "evento", "seq", "ack"])
 
 def log_csv(evento, seq=None, ack=None):
     writer.writerow([time.time(), evento, seq, ack])
+    log_file.flush()
 
 
 """
@@ -64,7 +65,7 @@ expected_seq = 0  # próximo número de sequência que o servidor espera receber
 
 # para simulação de perda
 pacotes_recebidos = 0
-PROXIMA_PERDA = 15  # O 15º pacote de dados será descartado propositalmente
+PROXIMA_PERDA = 5  # O 15º pacote de dados será descartado propositalmente
 
 while True: # sempre na escuta
     # recebe até 1032 bytes (1024 de dados + 8 de header) 
@@ -77,7 +78,7 @@ while True: # sempre na escuta
     #     continue
     if data_len > 0:
         pacotes_recebidos += 1
-        if pacotes_recebidos == PROXIMA_PERDA:
+        if pacotes_recebidos >= PROXIMA_PERDA:
             log("PERDA_SIMULADA", seq=seq)
             # Resetamos ou avançamos o próximo alvo se quiser testar múltiplas perdas
             PROXIMA_PERDA = 999 
