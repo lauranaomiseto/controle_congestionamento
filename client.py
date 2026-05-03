@@ -71,7 +71,7 @@ while base_ptr < len(data_to_send): # enquanto não terminar de enviar os dados
         bytes_in_flight = 0  
         current_attempt_ptr = base_ptr
         
-        while bytes_in_flight < CWND and current_attempt_ptr < len(data_to_send): # até atingir o limite da janela ou terminar de enviar os dados
+        while bytes_in_flight < min(CWND, MSS) and current_attempt_ptr < len(data_to_send): # até atingir o limite da janela ou terminar de enviar os dados
             chunk = data_to_send[current_attempt_ptr:current_attempt_ptr+MSS] # payload
             packet = create_packet(current_attempt_ptr + 1, chunk) # o bit SYN "consumiu" (pkt de controle) o primeiro número de sequência
             client.sendto(packet, addr)
