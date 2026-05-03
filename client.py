@@ -15,9 +15,9 @@ client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 client.settimeout(RTO) # config o timeout
 addr = ('localhost', 6789)
 
-# =========================
-# LOGS (visual + CSV)
-# =========================
+"""
+Logs
+"""
 def log(evento, **dados):
     tempo = f"{time.time():.3f}"
     info = " | ".join(f"{k}={v}" for k, v in dados.items())
@@ -33,6 +33,13 @@ def log_csv(evento, seq=None, ack=None):
 
 """
 Função para montar o pacote (cabeçalho + dados)
+
+- seq: 16 bits (2 bytes)
+- ack_num: 16 bits (2 bytes)
+- buffer: 16 bits (2 bytes)
+- data_len: 13 bits
+- flags (A|S|F): 3 bits 
+
 """
 def create_packet(seq, data, flags=0):
     # monta pacote com header (8 bytes) + dados 
@@ -45,66 +52,63 @@ def create_packet(seq, data, flags=0):
 
 # THREE-WAY HANDSHAKE
 log("HANDSHAKE_START")
+log_csv("HANDSHAKE_START")
 client.sendto(create_packet(0, b"", flags=2), addr) # envia SYN (2 = 0b010)
 # b"<string>" cria um obj bytes
 
 try:
     resp, _ = client.recvfrom(1032)
     _, server_isn, _, _ = struct.unpack('!HHHH', resp[:8])
-    next_seq = server_isn 
-    # como nesse cenário o cliente é quem manda os dados e o servidor só confirma, o cliente pode focar no própiro controle de ponteiro (base_ptr) e não precisa utilizar o next_seq (que seria o ISN do servidor)
-    log("HANDSHAKE_OK", server_isn=server_isn)
+    log("HANDSHAKE_OK")
+    log_csv("HANDSHAKE_OK")
 except socket.timeout:
     log("HANDSHAKE_FAIL")
+    log_csv("HANDSHAKE_FAIL")
     exit()
 
-# TRANSMISSÃO (com controle de congestionamento) 
+# TRANSMISSÃO 
 data_to_send = b"A"*50000 # 50KB de dados simulados
 base_ptr = 0 # aponta para o último byte com payload confirmado (ACK)
 
-# print(f"{'Estado':<15} | {'CWND':<10} | {'SSTHRESH':<10} | {'Progresso'}")
-# print("-" * 55)
-
-while base_ptr < len(data_to_send): # enquanto não terminar de enviar os dados
+while base_ptr < len(data_to_send): 
     try:
         # dados enviados mas não confirmados
         bytes_in_flight = 0  
         current_attempt_ptr = base_ptr
         
-        while bytes_in_flight < CWND and current_attempt_ptr < len(data_to_send): # até atingir o limite da janela ou terminar de enviar os dados
+        while bytes_in_flight < CWND and current_attempt_ptr < len(data_to_send):
             chunk = data_to_send[current_attempt_ptr:current_attempt_ptr+MSS] # payload
-            packet = create_packet(current_attempt_ptr + 1, chunk) # o bit SYN "consumiu" (pkt de controle) o primeiro número de sequência
+            packet = create_packet(current_attempt_ptr+1, chunk) # o bit SYN "consumiu" (pkt de controle) o primeiro número de sequência
             client.sendto(packet, addr)
             
-            log("ENVIO", seq=current_attempt_ptr+1, bytes=len(chunk))
+            log("ENVIO", seq=current_attempt_ptr+1, cwnd=CWND, ssthresh=SSTHRESH)
             log_csv("ENVIO", seq=current_attempt_ptr+1)
 
             bytes_in_flight += len(chunk)
             current_attempt_ptr += len(chunk)
 
-        # espera pela confirmação (ACK) 
-        resp, _ = client.recvfrom(1032)
-        _, ack_num, _, _ = struct.unpack('!HHHH', resp[:8])
+            # espera pela confirmação (ACK) 
+            resp, _ = client.recvfrom(1032)
+            _, ack_num, _, _ = struct.unpack('!HHHH', resp[:8])
 
-        # se o ACK avançou, significa que os dados chegaram
-        if ack_num > base_ptr:
-            base_ptr = ack_num - 1
-            
-            # Lógica de crescimento da Janela (CWND) 
-            if CWND < SSTHRESH:
-                # MODO SLOW START: crescimento exponencial (+1 MSS por ACK)
-                CWND += MSS
-                log("CWND_UPDATE", modo="SLOW_START", cwnd=CWND, ack=ack_num)
-            else:
-                # MODO CONGESTION AVOIDANCE: crescimento linear
-                CWND += (MSS * MSS) // CWND
-                log("CWND_UPDATE", modo="AVOIDANCE", cwnd=CWND, ack=ack_num)
+            # se o ACK avançou, significa que os dados chegaram
+            if ack_num > base_ptr:
+                base_ptr = ack_num - 1
+                
+                # Lógica de crescimento da Janela (CWND) 
+                if CWND < SSTHRESH:
+                    # MODO SLOW START: crescimento exponencial (+1 MSS por ACK)
+                    CWND += MSS
+                    log("CWND_UPDATE", modo="SLOW_START", cwnd=CWND, ssthresh=SSTHRESH, ack=ack_num)
+                    log_csv("CWND_UPDATE_SLOW_START", ack=ack_num)
+                else:
+                    # MODO CONGESTION AVOIDANCE: crescimento linear
+                    CWND += (MSS * MSS) // CWND
+                    log("CWND_UPDATE", modo="AVOIDANCE", cwnd=CWND, ssthresh=SSTHRESH, ack=ack_num)
+                    log_csv("CWND_UPDATE_AVOIDANCE", ack=ack_num)
 
-            log_csv("ACK", ack=ack_num)
+                log_csv("ACK", ack=ack_num)
 
-            # IMPRESSÃO LIMPA: só uma linha por janela confirmada
-            # progresso = f"{(base_ptr/len(data_to_send)*100):.1f}%"
-            # print(f"{mode:<15} | {CWND:<10} | {SSTHRESH:<10} | {progresso}")
 
     except socket.timeout:
         # DETECÇÃO DE PERDA: temporizador RTO estoura 
@@ -114,11 +118,8 @@ while base_ptr < len(data_to_send): # enquanto não terminar de enviar os dados
         CWND = MSS # reseta a janela para o início 
         log("CWND_RESET", cwnd=CWND, ssthresh=SSTHRESH)
 
-        log_csv("TIMEOUT")
+        log_csv("CWND_RESET_TIMEOUT")
 
         # base_ptr NÃO avança, então o loop while vai tentar reenviar do mesmo ponto 
 
-        # print(f"{'!!! TIMEOUT':<15} | {CWND:<10} | {SSTHRESH:<10} | Retransmitindo...")
-
 log("FIM")
-print("Transferência finalizada com sucesso.")
