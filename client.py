@@ -25,6 +25,8 @@ def log(evento, **dados):
 
 
 inicio_absoluto = time.time()
+in_fast_recovery = False
+
 log_file = open("client_log.csv", "w", newline="")
 writer = csv.writer(log_file)
 writer.writerow(["tempo_relativo", "evento", "seq", "ack", "cwnd", "ssthresh", "fase"])
@@ -35,7 +37,12 @@ def log_csv(evento, seq=None, ack=None):
     
     # det em qual fase o alg está pro gráfico
     fase = "SLOW_START" if CWND < SSTHRESH else "CONGESTION_AVOIDANCE"
-    if evento == "TIMEOUT": fase = "LOSS"
+    
+    if in_fast_recovery:
+        fase = "FAST_RECOVERY"
+        
+    if evento == "TIMEOUT":
+        fase = "LOSS"
     
     writer.writerow([
         f"{tempo_relativo:.6f}", 
@@ -98,7 +105,6 @@ next_seq_ptr = 0 # o prox num de seq a ser enviado pela primeira vez
 timer_start = None # cronometro pro pacote mais antigo in flight
 dup_ack_count = 0 
 last_ack_received = -1
-in_fast_recovery = False
 
 log("INICIO_TRANSMISSAO", total_bytes=len(data_to_send))
 log_csv("INICIO_TRANSMISSAO", seq=0) 
@@ -142,6 +148,16 @@ while base_ptr < len(data_to_send):
                 SSTHRESH = max(CWND // 2, MSS * 2)
                 CWND = SSTHRESH + (3 * MSS)
                 in_fast_recovery = True
+
+                log("FAST_RECOVERY_START", cwnd=CWND, ssthresh=SSTHRESH)
+                log_csv("FAST_RECOVERY_START", ack=ack_num)
+
+            elif in_fast_recovery:
+                # cada ACK duplicado extra infla temporariamente a janela
+                CWND += MSS
+
+                log("FAST_RECOVERY_DUP_ACK", ack=ack_num, cwnd=CWND)
+                log_csv("FAST_RECOVERY_DUP_ACK", ack=ack_num)
 
         elif ack_num > last_ack_received:
             if in_fast_recovery:
