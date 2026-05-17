@@ -12,7 +12,7 @@ RTO = 0.5 # timeout de retransmissão em segundos (500ms)
 CWND = MSS 
 
 client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-client.settimeout(RTO) # config o timeout
+client.setblocking(False) # config o timeout pra config manual (não-bloqueante)
 addr = ('localhost', 6789)
 
 """
@@ -23,12 +23,36 @@ def log(evento, **dados):
     info = " | ".join(f"{k}={v}" for k, v in dados.items())
     print(f"[{tempo}] {evento:<18} | {info}")
 
+
+inicio_absoluto = time.time()
+in_fast_recovery = False
+
 log_file = open("client_log.csv", "w", newline="")
 writer = csv.writer(log_file)
-writer.writerow(["tempo", "evento", "seq", "ack", "cwnd", "ssthresh"])
+writer.writerow(["tempo_relativo", "evento", "seq", "ack", "cwnd", "ssthresh", "fase"])
 
 def log_csv(evento, seq=None, ack=None):
-    writer.writerow([time.time(), evento, seq, ack, CWND, SSTHRESH])
+    # calc o tempo relativo ao início para facilitar a análise (montagem de gráficos)
+    tempo_relativo = time.time() - inicio_absoluto
+    
+    # det em qual fase o alg está pro gráfico
+    fase = "SLOW_START" if CWND < SSTHRESH else "CONGESTION_AVOIDANCE"
+    
+    if in_fast_recovery:
+        fase = "FAST_RECOVERY"
+        
+    if evento == "TIMEOUT":
+        fase = "LOSS"
+    
+    writer.writerow([
+        f"{tempo_relativo:.6f}", 
+        evento, 
+        seq if seq is not None else "", 
+        ack if ack is not None else "", 
+        CWND, 
+        SSTHRESH,
+        fase
+    ])
 
 
 """
@@ -55,71 +79,132 @@ log("HANDSHAKE_START")
 log_csv("HANDSHAKE_START")
 client.sendto(create_packet(0, b"", flags=2), addr) # envia SYN (2 = 0b010)
 # b"<string>" cria um obj bytes
+start_handshake = time.time()
+handshake_success = False
 
-try:
-    resp, _ = client.recvfrom(1032)
-    _, server_isn, _, _ = struct.unpack('!HHHH', resp[:8])
-    log("HANDSHAKE_OK")
-    log_csv("HANDSHAKE_OK")
-except socket.timeout:
+while time.time() - start_handshake < RTO:
+    try:
+        resp, _ = client.recvfrom(1032)
+        _, server_isn, _, _ = struct.unpack('!HHHH', resp[:8])
+        log("HANDSHAKE_OK")
+        log_csv("HANDSHAKE_OK")
+        handshake_success = True
+        break
+    except (BlockingIOError, socket.error):
+        continue # Continua tentando até estourar o tempo manual
+
+if not handshake_success:
     log("HANDSHAKE_FAIL")
     log_csv("HANDSHAKE_FAIL")
     exit()
 
 # TRANSMISSÃO 
 data_to_send = b"A"*50000 # 50KB de dados simulados
-base_ptr = 0 # aponta para o último byte com payload confirmado (ACK)
+base_ptr = 0 # menor num de seq enviado mas não confirmado (ACK) pelo servidor
+next_seq_ptr = 0 # o prox num de seq a ser enviado pela primeira vez
+timer_start = None # cronometro pro pacote mais antigo in flight
+dup_ack_count = 0 
+last_ack_received = -1
+
+log("INICIO_TRANSMISSAO", total_bytes=len(data_to_send))
+log_csv("INICIO_TRANSMISSAO", seq=0) 
 
 while base_ptr < len(data_to_send): 
-    try:
-        # dados enviados mas não confirmados
-        bytes_in_flight = 0  
-        current_attempt_ptr = base_ptr
+    # --- 1. FASE DE ENVIO (evia o max da cwnd) ---
+    while (next_seq_ptr - base_ptr) < CWND and next_seq_ptr < len(data_to_send):
+        chunk = data_to_send[next_seq_ptr : next_seq_ptr + MSS] # payload
+        packet = create_packet(next_seq_ptr + 1, chunk) # o bit SYN "consumiu" (pkt de controle) o primeiro num da seq
+        client.sendto(packet, addr)
         
-        while bytes_in_flight < CWND and current_attempt_ptr < len(data_to_send):
-            chunk = data_to_send[current_attempt_ptr:current_attempt_ptr+MSS] # payload
-            packet = create_packet(current_attempt_ptr+1, chunk) # o bit SYN "consumiu" (pkt de controle) o primeiro número de sequência
-            client.sendto(packet, addr)
+        log("ENVIO", seq=next_seq_ptr+1, cwnd=CWND, base=base_ptr)
+        log_csv("ENVIO", seq=next_seq_ptr+1) # Registra cada pacote saindo
+        
+        # ini cronometro pro primeiro pacote da janela
+        if base_ptr == next_seq_ptr:
+            timer_start = time.time()
             
-            log("ENVIO", seq=current_attempt_ptr+1, cwnd=CWND, ssthresh=SSTHRESH)
-            log_csv("ENVIO", seq=current_attempt_ptr+1)
+        next_seq_ptr += len(chunk)
 
-            bytes_in_flight += len(chunk)
-            current_attempt_ptr += len(chunk)
+    # --- 2. FASE DE ESCUTA (processa ACKs recebidos) ---
+    try:
+        resp, _ = client.recvfrom(1032)
+        _, ack_num, _, _ = struct.unpack('!HHHH', resp[:8])
 
-            # espera pela confirmação (ACK) 
-            resp, _ = client.recvfrom(1032)
-            _, ack_num, _, _ = struct.unpack('!HHHH', resp[:8])
+        if ack_num == last_ack_received:
+            dup_ack_count += 1
+            log("ACK_DUPLICADO", ack=ack_num, count=dup_ack_count)
+            log_csv("ACK_DUPLICADO", ack=ack_num)
 
-            # se o ACK avançou, significa que os dados chegaram
-            if ack_num > base_ptr:
-                base_ptr = ack_num - 1
+            if dup_ack_count == 3:
+                log("FAST_RETRANSMIT", ack=ack_num)
+                log_csv("FAST_RETRANSMIT", ack=ack_num)
+
+                # retransmite o pacote perdido
+                chunk = data_to_send[ack_num-1 : ack_num-1 + MSS]
+                packet = create_packet(ack_num-1, chunk) # ack_num é o próximo esperado, então o perdido é ack_num-1
+                client.sendto(packet, addr)
                 
-                # Lógica de crescimento da Janela (CWND) 
-                if CWND < SSTHRESH:
-                    # MODO SLOW START: crescimento exponencial (+1 MSS por ACK)
-                    CWND += MSS
-                    log("CWND_UPDATE", modo="SLOW_START", cwnd=CWND, ssthresh=SSTHRESH, ack=ack_num)
-                    log_csv("CWND_UPDATE_SLOW_START", ack=ack_num)
-                else:
-                    # MODO CONGESTION AVOIDANCE: crescimento linear
-                    CWND += (MSS * MSS) // CWND
-                    log("CWND_UPDATE", modo="AVOIDANCE", cwnd=CWND, ssthresh=SSTHRESH, ack=ack_num)
-                    log_csv("CWND_UPDATE_AVOIDANCE", ack=ack_num)
+                # FAST RECOVERY
+                SSTHRESH = max(CWND // 2, MSS * 2)
+                CWND = SSTHRESH + (3 * MSS)
+                in_fast_recovery = True
 
-                log_csv("ACK", ack=ack_num)
+                log("FAST_RECOVERY_START", cwnd=CWND, ssthresh=SSTHRESH)
+                log_csv("FAST_RECOVERY_START", ack=ack_num)
 
+            elif in_fast_recovery:
+                # cada ACK duplicado extra infla temporariamente a janela
+                CWND += MSS
 
-    except socket.timeout:
-        # DETECÇÃO DE PERDA: temporizador RTO estoura 
-        log("TIMEOUT")
+                log("FAST_RECOVERY_DUP_ACK", ack=ack_num, cwnd=CWND)
+                log_csv("FAST_RECOVERY_DUP_ACK", ack=ack_num)
+
+        elif ack_num > last_ack_received:
+            if in_fast_recovery:
+                # saida do fast recovery (full ack recebido)
+                CWND = SSTHRESH
+                in_fast_recovery = False
+                log("FAST_RECOVERY_EXIT", ack=ack_num, cwnd=CWND)
+                log_csv("FAST_RECOVERY_EXIT", ack=ack_num)
+            
+            dup_ack_count = 0
+            last_ack_received = ack_num
+            base_ptr = ack_num - 1 # deslisa base (ack_num é o próximo esperado, então base é ack_num-1)
         
-        SSTHRESH = CWND // 2 # reduz o limite pela metade
-        CWND = MSS # reseta a janela para o início 
-        log("CWND_RESET", cwnd=CWND, ssthresh=SSTHRESH)
+            
+            # CONTROLE DE CONGESTIONAMENTO: 
+            if CWND < SSTHRESH:
+                CWND += MSS # SLOW START
+                log("ACK_SLOW_START", ack=ack_num, cwnd=CWND)
+                log_csv("ACK_SLOW_START", ack=ack_num)
+            else:
+                CWND += (MSS * MSS) // CWND # CONGESTION AVOIDANCE
+                log("ACK_CONG_AVOID", ack=ack_num, cwnd=CWND)
+                log_csv("ACK_CONG_AVOID", ack=ack_num)
+            
+            # se ainda tiver pacotes em trânsito, reinicia o timer
+            if base_ptr < next_seq_ptr:
+                timer_start = time.time()
+            else:
+                timer_start = None # nada em trânsito
+                
+    except (BlockingIOError, socket.error):
+        # nenhum pacote recebido no momento, segue para checar timeout
+        pass
 
-        log_csv("CWND_RESET_TIMEOUT")
+    # --- 3. FASE DE TIMEOUT (checa se o tempo expirou) ---
+    if timer_start and (time.time()-timer_start > RTO):
+        log("TIMEOUT", retransmitindo_de=base_ptr+1)
+        log_csv("TIMEOUT", seq=base_ptr+1)
 
-        # base_ptr NÃO avança, então o loop while vai tentar reenviar do mesmo ponto 
+        # volta o ponteiro de envio pra base pra retransmitir tudo
+        SSTHRESH = max(CWND // 2, MSS * 2)
+        CWND = MSS
+        next_seq_ptr = base_ptr 
+        timer_start = None 
+        dup_ack_count = 0
+        in_fast_recovery = False
 
-log("FIM")
+        log_csv("CWND_RESET", seq=base_ptr+1)
+
+log("FIM_TRANSMISSAO")
