@@ -37,21 +37,13 @@ def decode_header(header):
     return seq, ack_num, data_len, flags
 
 
-# =========================
-# LOGS (visual + CSV)
-# =========================
+"""
+Logs
+"""
 def log(evento, **dados):
     tempo = f"{time.time():.3f}"
     info = " | ".join(f"{k}={v}" for k, v in dados.items())
     print(f"[{tempo}] {evento:<18} | {info}")
-
-log_file = open("server_log.csv", "w", newline="")
-writer = csv.writer(log_file)
-writer.writerow(["tempo", "evento", "seq", "ack"])
-
-def log_csv(evento, seq=None, ack=None):
-    writer.writerow([time.time(), evento, seq, ack])
-    log_file.flush()
 
 
 """
@@ -63,27 +55,18 @@ server.bind(('localhost', 6789))
 log("SERVER_START")
 
 expected_seq = 0  # próximo número de sequência que o servidor espera receber 
-
-pacotes_recebidos = 0
-PROXIMA_PERDA = 20  
+out_of_order_buffer = {} # buffer pra pacotes recebidos fora de ordem 
 
 while True: # sempre na escuta
     # recebe até 1032 bytes (1024 de dados + 8 de header) 
     packet, addr = server.recvfrom(1032)
     seq, ack_num, data_len, flags = decode_header(packet[:8])
+    data = packet[8:] # extrai os dados com base no tamanho indicado no header
     
     # SIMULAÇÃO DE PERDA ALEATÓRIA 
     if random.random() < 0.05: # 5% dos pacotes serão "perdidos"
         log("PERDA_SIMULADA", seq=seq)
         continue
-    # if data_len > 0:
-    #     pacotes_recebidos += 1
-    #     if pacotes_recebidos >= PROXIMA_PERDA:
-    #         log("PERDA_SIMULADA", seq=seq)
-    #         # Resetamos ou avançamos o próximo alvo se quiser testar múltiplas perdas
-    #         PROXIMA_PERDA = np.inf 
-    #         continue
-
 
     # THREE-WAY HANDSHAKE 
     if flags & 2: # 2 = 0b010
@@ -94,14 +77,22 @@ while True: # sempre na escuta
         log("HANDSHAKE", ack=expected_seq)
     
     # PACOTE PADRÃO (não é SYN e contém dados)
-    elif data_len > 0:
+    if data_len > 0:
         if seq == expected_seq: # se for o pacote correto na ordem, faz a confirmação
             expected_seq += data_len
-            log("RECEBIDO", seq=seq, bytes=data_len, prox_ack=expected_seq)
-            log_csv("RECEBIDO", seq=seq, ack=expected_seq)
+            log("RECEBIDO_ORDEM", seq=seq, bytes=data_len, prox_ack=expected_seq)
+
+            while expected_seq in out_of_order_buffer: # checa se tem pacotes fora de ordem que agora podem ser processados
+                log("PROCESSA_BUFFER", seq=expected_seq)
+                next_data_len = len(out_of_order_buffer.pop(expected_seq))
+                expected_seq += next_data_len
+            
+        elif seq > expected_seq: # se for um pacote futuro, armazena no buffer de fora de ordem
+            if seq not in out_of_order_buffer:
+                log("FORA_ORDEM", seq=seq, bytes=data_len, prox_esperado=expected_seq)
+                out_of_order_buffer[seq] = data # armazena só os dados (sem o header)
         
-            # manda o ACK confirmando o que já recebeu 
-            # só faz o envio se for o esperado (não implementa ack duplicado)
-            ack_packet = create_header(0, expected_seq, 0, 4) # Flag A (ACK=4) 
-            server.sendto(ack_packet, addr)
-            log("ACK_ENVIADO", ack=expected_seq)
+        # sempre envia ack do que ainda tá esperando (gera acks duplicados es tiver gaps)
+        ack_packet = create_header(0, expected_seq, 0, 4) 
+        server.sendto(ack_packet, addr)
+        log("ACK_ENVIADO", ack=expected_seq)
