@@ -16,12 +16,15 @@ Função para montar o cabeçalho
 
 Total: 8 bytes
 """
-def create_header(seq, ack_num, data_len, flags):
+
+MAX_RWND = 15360 # 15 KB (tam max do buffer)
+
+def create_header(seq, ack_num, rwnd, data_len, flags):
     # o último campo de 16 bits (2 bytes) combina: 13 bits (tamanho) + 3 bits (flags A|S|F) 
     last_16 = (data_len << 3) | flags
     # o shift cria "espaço" para as flags e a operação or concatena seus bits
     
-    return struct.pack('!HHHH', seq, ack_num, 0, last_16) 
+    return struct.pack('!HHHH', seq, ack_num, rwnd, last_16) 
     # !HHHH: 
     # - !: big-endian (padrão para prodtocolos de rede)
     # - HHHH: 4 inteiros de 16 bits (2 bytes cada, 8 bytes no total) 
@@ -30,7 +33,7 @@ def create_header(seq, ack_num, data_len, flags):
 Função para desmontar o cabeçalho recebido
 """
 def decode_header(header):
-    seq, ack_num, _, last_16 = struct.unpack('!HHHH', header)
+    seq, ack_num, rwnd, last_16 = struct.unpack('!HHHH', header)
     data_len = last_16 >> 3 # extrai os 13 bits de tamanho
     flags = last_16 & 0x7 # extrai os 3 bits de flags (A, S, F) 
     # 0x7 = 0b0111
@@ -68,11 +71,15 @@ while True: # sempre na escuta
         log("PERDA_SIMULADA", seq=seq)
         continue
 
+    # calc a mem ocupada pelos pacotes fora de ordem
+    buffer_ocupado = sum(len(payload) for payload in out_of_order_buffer.values())
+    rwnd = max(0, MAX_RWND - buffer_ocupado) # só pra evitar nums negativos
+
     # THREE-WAY HANDSHAKE 
     if flags & 2: # 2 = 0b010
         expected_seq = seq + 1  # def próx esperado como ISN (num seq ini) + 1
         # responde com ACK e SYN (4 + 2 = 6) 
-        ack_packet = create_header(100, expected_seq, 0, 6) 
+        ack_packet = create_header(100, expected_seq, rwnd, 0, 6) 
         server.sendto(ack_packet, addr)
         log("HANDSHAKE", ack=expected_seq)
     
@@ -93,6 +100,6 @@ while True: # sempre na escuta
                 out_of_order_buffer[seq] = data # armazena só os dados (sem o header)
         
         # sempre envia ack do que ainda tá esperando (gera acks duplicados es tiver gaps)
-        ack_packet = create_header(0, expected_seq, 0, 4) 
+        ack_packet = create_header(0, expected_seq, rwnd, 0, 4) 
         server.sendto(ack_packet, addr)
         log("ACK_ENVIADO", ack=expected_seq)

@@ -85,7 +85,7 @@ handshake_success = False
 while time.time() - start_handshake < RTO:
     try:
         resp, _ = client.recvfrom(1032)
-        _, server_isn, _, _ = struct.unpack('!HHHH', resp[:8])
+        _, server_isn, rwnd, _ = struct.unpack('!HHHH', resp[:8])
         log("HANDSHAKE_OK")
         log_csv("HANDSHAKE_OK")
         handshake_success = True
@@ -112,7 +112,9 @@ log_csv("INICIO_TRANSMISSAO", seq=0)
 
 while base_ptr < len(data_to_send): 
     # --- 1. FASE DE ENVIO (evia o max da cwnd) ---
-    while (next_seq_ptr - base_ptr) < CWND and next_seq_ptr < len(data_to_send):
+
+    janela = min(CWND, rwnd)
+    while (next_seq_ptr - base_ptr) < janela and next_seq_ptr < len(data_to_send):
         chunk = data_to_send[next_seq_ptr : next_seq_ptr + MSS] # payload
         num_seq = next_seq_ptr + 1 # o número de sequência do pacote é o byte inicial + 1 (porque o bit SYN "consome" o primeiro número)
         packet = create_packet(num_seq, chunk) 
@@ -131,7 +133,7 @@ while base_ptr < len(data_to_send):
     # --- 2. FASE DE ESCUTA (processa ACKs recebidos) ---
     try:
         resp, _ = client.recvfrom(1032)
-        _, ack_num, _, _ = struct.unpack('!HHHH', resp[:8])
+        _, ack_num, rwnd, _ = struct.unpack('!HHHH', resp[:8])
 
         if ack_num == last_ack_received:
             dup_ack_count += 1
