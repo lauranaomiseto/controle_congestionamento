@@ -105,6 +105,7 @@ next_seq_ptr = 0 # o prox num de seq a ser enviado pela primeira vez
 timer_start = None # cronometro pro pacote mais antigo in flight
 dup_ack_count = 0 
 last_ack_received = -1
+unacked_packets = {} # buffer para os pacotes enviados e não confirmados
 
 log("INICIO_TRANSMISSAO", total_bytes=len(data_to_send))
 log_csv("INICIO_TRANSMISSAO", seq=0) 
@@ -113,11 +114,13 @@ while base_ptr < len(data_to_send):
     # --- 1. FASE DE ENVIO (evia o max da cwnd) ---
     while (next_seq_ptr - base_ptr) < CWND and next_seq_ptr < len(data_to_send):
         chunk = data_to_send[next_seq_ptr : next_seq_ptr + MSS] # payload
-        packet = create_packet(next_seq_ptr + 1, chunk) # o bit SYN "consumiu" (pkt de controle) o primeiro num da seq
+        num_seq = next_seq_ptr + 1 # o número de sequência do pacote é o byte inicial + 1 (porque o bit SYN "consome" o primeiro número)
+        packet = create_packet(num_seq, chunk) 
+        unacked_packets[num_seq] = packet # salva no buffer
         client.sendto(packet, addr)
         
-        log("ENVIO", seq=next_seq_ptr+1, cwnd=CWND, base=base_ptr)
-        log_csv("ENVIO", seq=next_seq_ptr+1) # Registra cada pacote saindo
+        log("ENVIO", seq=num_seq, cwnd=CWND, base=base_ptr)
+        log_csv("ENVIO", seq=num_seq) # Registra cada pacote saindo
         
         # ini cronometro pro primeiro pacote da janela
         if base_ptr == next_seq_ptr:
@@ -139,10 +142,9 @@ while base_ptr < len(data_to_send):
                 log("FAST_RETRANSMIT", ack=ack_num)
                 log_csv("FAST_RETRANSMIT", ack=ack_num)
 
-                # retransmite o pacote perdido
-                chunk = data_to_send[ack_num-1 : ack_num-1 + MSS]
-                packet = create_packet(ack_num-1, chunk) # ack_num é o próximo esperado, então o perdido é ack_num-1
-                client.sendto(packet, addr)
+                # retransmite o pacote perdido direto do buffer
+                if ack_num in unacked_packets:
+                    client.sendto(unacked_packets[ack_num], addr)
                 
                 # FAST RECOVERY
                 SSTHRESH = max(CWND // 2, MSS * 2)
@@ -160,6 +162,11 @@ while base_ptr < len(data_to_send):
                 log_csv("FAST_RECOVERY_DUP_ACK", ack=ack_num)
 
         elif ack_num > last_ack_received:
+            # limpa os pacotes já confirmados do buffer
+            for seq_key in list(unacked_packets.keys()):
+                if seq_key < ack_num:
+                    del unacked_packets[seq_key]
+
             if in_fast_recovery:
                 # saida do fast recovery (full ack recebido)
                 CWND = SSTHRESH
@@ -171,7 +178,6 @@ while base_ptr < len(data_to_send):
             last_ack_received = ack_num
             base_ptr = ack_num - 1 # deslisa base (ack_num é o próximo esperado, então base é ack_num-1)
         
-            
             # CONTROLE DE CONGESTIONAMENTO: 
             if CWND < SSTHRESH:
                 CWND += MSS # SLOW START
